@@ -72,9 +72,10 @@ const getFlights = asyncHandler(async (req, res) => {
         res.status(200).json(mappedFlights);
 
     } catch (error) {
-        console.error('AviationStack API Error:', error.response?.data || error.message);
+        const errorDetails = error.response?.data || error.message;
+        console.error('AviationStack API Error:', errorDetails);
         res.status(500);
-        throw new Error('Failed to fetch live flights from AviationStack');
+        throw new Error(`Failed to fetch live flights: ${JSON.stringify(errorDetails)}`);
     }
 });
 
