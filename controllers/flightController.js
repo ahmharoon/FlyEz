@@ -1,51 +1,81 @@
 const asyncHandler = require('express-async-handler');
 const Flight = require('../models/Flight');
 
-// @desc    Get all flights with search filters
+const axios = require('axios');
+
+// @desc    Get all flights from AviationStack (Live)
 // @route   GET /api/flights
 // @access  Public
 const getFlights = asyncHandler(async (req, res) => {
-    const { origin, destination, date, time, stops, seatClass, maxPrice } = req.query;
-    let query = {};
+    const { origin, destination, date, flight_status } = req.query;
 
-    if (origin) {
-        query.origin = { $regex: origin, $options: 'i' };
-    }
-    if (destination) {
-        query.destination = { $regex: destination, $options: 'i' };
-    }
-    if (date) {
-        const startDate = new Date(date);
-        const endDate = new Date(date);
-        endDate.setDate(endDate.getDate() + 1);
-        query.departureDate = { $gte: startDate, $lt: endDate };
-    }
-    if (time) {
-        // Partial match for time (e.g. "10", "10:30")
-        query.departureTime = { $regex: time, $options: 'i' };
-    }
-    if (stops) {
-        query.numberOfStops = Number(stops);
-    }
+    try {
+        // Build query params for Aviationstack
+        // Documentation: http://api.aviationstack.com/v1/flights
+        const params = {
+            access_key: process.env.AVIATIONSTACK_API_KEY,
+            limit: 50, // Limit to 50 flights for performance
+        };
 
-    let flights = await Flight.find(query);
+        // Aviationstack has specific query parameters, map our frontend queries to them:
+        if (flight_status) {
+            params.flight_status = flight_status;
+        } else {
+            params.flight_status = 'scheduled'; // Default to future flights
+        }
 
-    // Filter by Price if maxPrice is provided
-    if (maxPrice) {
-        const max = Number(maxPrice);
-        const cls = seatClass || 'Economy';
-        let multiplier = 1;
+        // Aviationstack uses IATA codes for airports (e.g. 'JFK', 'LHR')
+        // We will pass these directly if the frontend sends them 
+        if (origin) params.dep_iata = origin;
+        if (destination) params.arr_iata = destination;
 
-        if (cls === 'Business') multiplier = 1.5;
-        if (cls === 'First') multiplier = 2.5;
+        // Perform the API request to AviationStack
+        const response = await axios.get('http://api.aviationstack.com/v1/flights', { params });
+        
+        if (!response.data || !response.data.data) {
+            return res.status(200).json([]);
+        }
 
-        flights = flights.filter(flight => {
-            const price = flight.basePrice * multiplier;
-            return price <= max;
+        // Map the AviationStack response exactly to our existing Mongoose 'Flight' model schema 
+        // to prevent the Flutter frontend from breaking.
+        const mappedFlights = response.data.data.map(flight => {
+            
+            // Generate a random base price since AviationStack free tier does not provide pricing
+            const randomBasePrice = Math.floor(Math.random() * (800 - 150 + 1)) + 150; 
+            
+            // Extract the date and time from the departure scheduled ISO string
+            let depDate = new Date();
+            let depTime = "00:00";
+            
+            if (flight.departure && flight.departure.scheduled) {
+                const dateObj = new Date(flight.departure.scheduled);
+                depDate = dateObj;
+                depTime = `${dateObj.getHours().toString().padStart(2, '0')}:${dateObj.getMinutes().toString().padStart(2, '0')}`;
+            }
+
+            return {
+                _id: flight.flight.iata || flight.flight.number || Math.random().toString(), // Mock Mongo ID
+                flightNumber: flight.flight.iata || flight.flight.number || "UNKNOWN",
+                airline: flight.airline.name || "Unknown Airline",
+                origin: flight.departure.iata || flight.departure.airport || "Unknown Origin",
+                destination: flight.arrival.iata || flight.arrival.airport || "Unknown Destination",
+                departureDate: depDate,
+                departureTime: depTime,
+                isDirect: true, // Assuming direct for simplicity
+                numberOfStops: 0,
+                availableSeats: Math.floor(Math.random() * 50) + 1, // Mock seats
+                basePrice: randomBasePrice,
+                status: flight.flight_status // Bonus mapping
+            };
         });
-    }
 
-    res.status(200).json(flights);
+        res.status(200).json(mappedFlights);
+
+    } catch (error) {
+        console.error('AviationStack API Error:', error.response?.data || error.message);
+        res.status(500);
+        throw new Error('Failed to fetch live flights from AviationStack');
+    }
 });
 
 // @desc    Get flight details
