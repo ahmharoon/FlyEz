@@ -3,47 +3,57 @@ const Flight = require('../models/Flight');
 
 const axios = require('axios');
 
-// @desc    Get all flights from AviationStack (Live)
+const CacheTracker = require('../models/CacheTracker');
+
+// @desc    Get all flights from MongoDB (Cached) or AviationStack (Live)
 // @route   GET /api/flights
 // @access  Public
 const getFlights = asyncHandler(async (req, res) => {
     const { origin, destination, date, flight_status } = req.query;
 
     try {
-        // Build query params for Aviationstack
-        // Documentation: http://api.aviationstack.com/v1/flights
-        const params = {
-            access_key: process.env.AVIATIONSTACK_API_KEY,
-            limit: 50, // Limit to 50 flights for performance
-        };
+        // 1. Check if cache is still fresh (within 8 hours)
+        const cacheConfig = await CacheTracker.findOne({ cacheName: 'aviationstack_flights' });
+        const EIGHT_HOURS_IN_MS = 8 * 60 * 60 * 1000;
+        const now = new Date();
 
-        // Aviationstack has specific query parameters, map our frontend queries to them:
-        if (flight_status) {
-            params.flight_status = flight_status;
-        } else {
-            params.flight_status = 'scheduled'; // Default to future flights
+        let isCacheFresh = false;
+        if (cacheConfig && (now - cacheConfig.lastUpdated) < EIGHT_HOURS_IN_MS) {
+            isCacheFresh = true;
         }
 
-        // Aviationstack uses IATA codes for airports (e.g. 'JFK', 'LHR')
-        // We will pass these directly if the frontend sends them 
+        // 2. Condition A: Cache is Fresh -> Return from MongoDB
+        if (isCacheFresh) {
+            console.log("Serving flights from MongoDB Cache (No API call made)");
+            let query = {};
+            if (origin) query.origin = { $regex: origin, $options: 'i' };
+            if (destination) query.destination = { $regex: destination, $options: 'i' };
+            if (flight_status) query.status = flight_status;
+
+            const cachedFlights = await Flight.find(query);
+            return res.status(200).json(cachedFlights);
+        }
+
+        // 3. Condition B: Cache is Stale -> Call Aviationstack API
+        console.log("Cache is stale or empty. Calling Aviationstack API...");
+        const params = {
+            access_key: process.env.AVIATIONSTACK_API_KEY,
+            limit: 50,
+            flight_status: flight_status || 'scheduled'
+        };
+
         if (origin) params.dep_iata = origin;
         if (destination) params.arr_iata = destination;
 
-        // Perform the API request to AviationStack
         const response = await axios.get('http://api.aviationstack.com/v1/flights', { params });
         
         if (!response.data || !response.data.data) {
             return res.status(200).json([]);
         }
 
-        // Map the AviationStack response exactly to our existing Mongoose 'Flight' model schema 
-        // to prevent the Flutter frontend from breaking.
+        // Map the AviationStack response
         const mappedFlights = response.data.data.map(flight => {
-            
-            // Generate a random base price since AviationStack free tier does not provide pricing
             const randomBasePrice = Math.floor(Math.random() * (800 - 150 + 1)) + 150; 
-            
-            // Extract the date and time from the departure scheduled ISO string
             let depDate = new Date();
             let depTime = "00:00";
             
@@ -54,28 +64,50 @@ const getFlights = asyncHandler(async (req, res) => {
             }
 
             return {
-                _id: flight.flight.iata || flight.flight.number || Math.random().toString(), // Mock Mongo ID
-                flightNumber: flight.flight.iata || flight.flight.number || "UNKNOWN",
+                flightNumber: flight.flight.iata || flight.flight.number || `UNKNOWN-${Math.random()}`,
                 airline: flight.airline.name || "Unknown Airline",
                 origin: flight.departure.iata || flight.departure.airport || "Unknown Origin",
                 destination: flight.arrival.iata || flight.arrival.airport || "Unknown Destination",
                 departureDate: depDate,
                 departureTime: depTime,
-                isDirect: true, // Assuming direct for simplicity
+                isDirect: true,
                 numberOfStops: 0,
-                availableSeats: Math.floor(Math.random() * 50) + 1, // Mock seats
+                availableSeats: Math.floor(Math.random() * 50) + 1,
                 basePrice: randomBasePrice,
-                status: flight.flight_status // Bonus mapping
+                status: flight.flight_status
             };
         });
 
-        res.status(200).json(mappedFlights);
+        // 4. Update the MongoDB Cache 
+        // Note: Using deleteMany and insertMany to cleanly replace the catalog
+        await Flight.deleteMany({});
+        const insertedFlights = await Flight.insertMany(mappedFlights);
+
+        // Update the Cache Tracker timestamp
+        await CacheTracker.findOneAndUpdate(
+            { cacheName: 'aviationstack_flights' }, 
+            { lastUpdated: now }, 
+            { upsert: true, new: true }
+        );
+
+        // 5. Return the newly fetched (and now cached) flights
+        res.status(200).json(insertedFlights);
 
     } catch (error) {
-        const errorDetails = error.response?.data || error.message;
-        console.error('AviationStack API Error:', errorDetails);
+        // Fallback: If AviationStack fails, try to return whatever is in the DB anyway
+        console.error('AviationStack API Error or Cache Error:', error.response?.data || error.message);
+        try {
+            const fallbackFlights = await Flight.find({});
+            if (fallbackFlights.length > 0) {
+                console.log("Fallback: Returning expired cache due to API failure.");
+                return res.status(200).json(fallbackFlights);
+            }
+        } catch (e) {
+            console.error("Fallback failed too.");
+        }
+        
         res.status(500);
-        throw new Error(`Failed to fetch live flights: ${JSON.stringify(errorDetails)}`);
+        throw new Error('Failed to fetch live flights and no cache exists');
     }
 });
 
