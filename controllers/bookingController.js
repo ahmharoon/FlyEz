@@ -58,7 +58,11 @@ const getMyBookings = asyncHandler(async (req, res) => {
     const bookings = await Booking.find({ user: req.user.id })
         .populate('flight')
         .sort('-createdAt'); // Latest first
-    res.status(200).json(bookings);
+        
+    // Filter out bookings where flight is null (e.g., deleted flights)
+    const validBookings = bookings.filter(b => b.flight != null);
+    
+    res.status(200).json(validBookings);
 });
 
 // @desc    Cancel booking

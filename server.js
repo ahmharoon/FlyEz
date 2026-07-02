@@ -20,6 +20,8 @@ app.use(cors());
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/flights', require('./routes/flightRoutes'));
 app.use('/api/bookings', require('./routes/bookingRoutes'));
+app.use('/api/nlp', require('./routes/nlpRoutes'));
+app.use('/api/payments', require('./routes/paymentRoutes'));
 
 // Error Handler
 app.use(errorHandler);

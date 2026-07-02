@@ -1,8 +1,5 @@
 const asyncHandler = require('express-async-handler');
 const Flight = require('../models/Flight');
-
-const axios = require('axios');
-
 const CacheTracker = require('../models/CacheTracker');
 
 // @desc    Get all flights from MongoDB (Cached) or AviationStack (Live)
@@ -31,57 +28,114 @@ const getFlights = asyncHandler(async (req, res) => {
             if (flight_status) query.status = flight_status;
 
             const cachedFlights = await Flight.find(query);
-            return res.status(200).json(cachedFlights);
+            
+            // If we actually found cached flights matching the query, return them.
+            if (cachedFlights.length > 0) {
+                return res.status(200).json(cachedFlights);
+            }
+            
+            // If this was a general "All Flights" query (no origin/dest) and we have some flights in the DB, return them
+            if (Object.keys(query).length === 0) {
+                const totalFlights = await Flight.countDocuments();
+                if (totalFlights > 0) {
+                    return res.status(200).json(cachedFlights);
+                }
+            }
+            
+            // Otherwise, we either have a completely empty DB, or the specific search (e.g. LHE -> KHI) 
+            // wasn't found in our small 50-flight cache. Fall through to fetch it directly from Aviationstack!
+            console.log("No matches found in cache for query, or cache is completely empty. Falling through to live API.");
         }
 
-        // 3. Condition B: Cache is Stale -> Call Aviationstack API
-        console.log("Cache is stale or empty. Calling Aviationstack API...");
-        const params = {
-            access_key: process.env.AVIATIONSTACK_API_KEY,
-            limit: 50,
-            flight_status: flight_status || 'scheduled'
+        // Fetch existing flights so we can persist their prices permanently!
+        const existingFlights = await Flight.find({});
+        const existingPrices = {};
+        existingFlights.forEach(f => { existingPrices[f.flightNumber] = f.basePrice; });
+
+        let mappedFlights = [];
+
+        // 3. Condition B: Cache is Stale — only search if route provided (SerpAPI)
+        if (!origin || !destination) {
+            // No route specified and cache is stale/empty — return whatever is in DB
+            const fallback = await Flight.find({}).limit(50);
+            return res.status(200).json(fallback);
+        }
+
+        console.log("Using SerpAPI Google Flights for specific route...");
+        const SerpApi = require('google-search-results-nodejs');
+        const search = new SerpApi.GoogleSearch(process.env.SERPAPI_API_KEY);
+
+        let outboundDate = date;
+        if (!outboundDate) {
+            const tomorrow = new Date();
+            tomorrow.setDate(tomorrow.getDate() + 1);
+            outboundDate = tomorrow.toISOString().split('T')[0];
+        }
+
+        const serpParams = {
+            engine: "google_flights",
+            departure_id: origin,
+            arrival_id: destination,
+            outbound_date: outboundDate,
+            currency: "USD",
+            hl: "en",
+            type: "2",
         };
 
-        if (origin) params.dep_iata = origin;
-        if (destination) params.arr_iata = destination;
+        const getSerpApiData = () => new Promise((resolve, reject) => {
+            search.json(serpParams, (data) => {
+                if (data.error) reject(new Error(data.error));
+                else resolve(data);
+            });
+        });
 
-        const response = await axios.get('http://api.aviationstack.com/v1/flights', { params });
-        
-        if (!response.data || !response.data.data) {
+        const data = await getSerpApiData();
+        const rawFlights = [...(data.best_flights || []), ...(data.other_flights || [])];
+
+        if (rawFlights.length === 0) {
             return res.status(200).json([]);
         }
 
-        // Map the AviationStack response
-        const mappedFlights = response.data.data.map(flight => {
-            const randomBasePrice = Math.floor(Math.random() * (800 - 150 + 1)) + 150; 
-            let depDate = new Date();
+        mappedFlights = rawFlights.map(flightOption => {
+            const firstLeg = flightOption.flights[0];
+            const lastLeg = flightOption.flights[flightOption.flights.length - 1];
+            const fNumber = firstLeg.flight_number || `UNKNOWN-${Math.random()}`;
+
             let depTime = "00:00";
-            
-            if (flight.departure && flight.departure.scheduled) {
-                const dateObj = new Date(flight.departure.scheduled);
-                depDate = dateObj;
-                depTime = `${dateObj.getHours().toString().padStart(2, '0')}:${dateObj.getMinutes().toString().padStart(2, '0')}`;
+            let depDate = new Date();
+            if (firstLeg.departure_airport && firstLeg.departure_airport.time) {
+                depDate = new Date(firstLeg.departure_airport.time);
+                depTime = `${depDate.getHours().toString().padStart(2, '0')}:${depDate.getMinutes().toString().padStart(2, '0')}`;
             }
 
             return {
-                flightNumber: flight.flight.iata || flight.flight.number || `UNKNOWN-${Math.random()}`,
-                airline: flight.airline.name || "Unknown Airline",
-                origin: flight.departure.iata || flight.departure.airport || "Unknown Origin",
-                destination: flight.arrival.iata || flight.arrival.airport || "Unknown Destination",
+                flightNumber: fNumber,
+                airline: firstLeg.airline || "Unknown Airline",
+                origin: firstLeg.departure_airport.id || origin,
+                destination: lastLeg.arrival_airport.id || destination,
                 departureDate: depDate,
                 departureTime: depTime,
-                isDirect: true,
-                numberOfStops: 0,
+                isDirect: !flightOption.layovers,
+                numberOfStops: flightOption.layovers ? flightOption.layovers.length : 0,
                 availableSeats: Math.floor(Math.random() * 50) + 1,
-                basePrice: randomBasePrice,
-                status: flight.flight_status
+                basePrice: flightOption.price || existingPrices[fNumber] || Math.floor(Math.random() * (800 - 150 + 1)) + 150,
+                status: "scheduled",
             };
         });
 
-        // 4. Update the MongoDB Cache 
-        // Note: Using deleteMany and insertMany to cleanly replace the catalog
-        await Flight.deleteMany({});
-        const insertedFlights = await Flight.insertMany(mappedFlights);
+        // 4. Update the MongoDB Cache Gracefully
+        // Instead of wiping the DB, we bulk upsert. This lets the mock cache grow
+        // dynamically, allowing you to search multiple routes without un-learning the previous ones!
+        if (mappedFlights.length > 0) {
+            const bulkOps = mappedFlights.map(flight => ({
+                updateOne: {
+                    filter: { flightNumber: flight.flightNumber },
+                    update: { $set: flight },
+                    upsert: true
+                }
+            }));
+            await Flight.bulkWrite(bulkOps);
+        }
 
         // Update the Cache Tracker timestamp
         await CacheTracker.findOneAndUpdate(
@@ -90,8 +144,10 @@ const getFlights = asyncHandler(async (req, res) => {
             { upsert: true, new: true }
         );
 
-        // 5. Return the newly fetched (and now cached) flights
-        res.status(200).json(insertedFlights);
+        // Fetch the fully saved flights back out of MongoDB so they have their true ObjectId "_id" for booking!
+        const savedFlightNumbers = mappedFlights.map(f => f.flightNumber);
+        const finalSavedFlights = await Flight.find({ flightNumber: { $in: savedFlightNumbers } });
+        res.status(200).json(finalSavedFlights);
 
     } catch (error) {
         // Fallback: If AviationStack fails, try to return whatever is in the DB anyway
