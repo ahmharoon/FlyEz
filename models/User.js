@@ -31,10 +31,27 @@ const userSchema = new mongoose.Schema({
     },
     resetPasswordCode: String,
     resetPasswordExpire: Date,
+    status: {
+        type: String,
+        enum: ['verified', 'unverified', 'processing', 'suspended'],
+        default: 'processing',
+    },
+    emailVerificationCode: String,
+    emailVerificationExpire: Date,
     nlpCredits: {
         type: Number,
         default: 1,
         min: 0,
+    },
+    // Masked card metadata only — never store the full card number or CVV,
+    // even for this mock payment flow.
+    paymentMethod: {
+        cardholderName: String,
+        brand: String,
+        last4: String,
+        expiryMonth: String,
+        expiryYear: String,
+        savedAt: Date,
     },
 }, {
     timestamps: true,
@@ -43,7 +60,7 @@ const userSchema = new mongoose.Schema({
 // Encrypt password using bcrypt
 userSchema.pre('save', async function (next) {
     if (!this.isModified('password')) {
-        next();
+        return next();
     }
 
     const salt = await bcrypt.genSalt(10);

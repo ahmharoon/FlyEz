@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const asyncHandler = require('express-async-handler');
 const Booking = require('../models/Booking');
 const Flight = require('../models/Flight');
@@ -6,45 +7,81 @@ const Flight = require('../models/Flight');
 // @route   POST /api/bookings
 // @access  Private
 const createBooking = asyncHandler(async (req, res) => {
-    const { flightId, numberOfSeats, seatClass, extraLuggage } = req.body;
+    const { flightId, flight: inlineFlight, numberOfSeats, seatClass, extraLuggage, bundleId, legIndex } = req.body;
 
-    // 1. Verify seat availability
-    const flight = await Flight.findById(flightId);
+    // 1. Resolve a real Flight document.
+    // Flights booked from a plain one-way search are already persisted, so
+    // `flightId` alone resolves them. Round-trip/multi-city results from the
+    // AI assistant are built in-memory from SerpAPI and never saved — they
+    // arrive with a synthetic (non-ObjectId) id, so the client also sends
+    // the flight's own details inline and we upsert a real document for it
+    // here, keyed by flightNumber (the same key flightController.js already
+    // uses when caching one-way results).
+    let flight = null;
+    if (flightId && mongoose.Types.ObjectId.isValid(flightId)) {
+        flight = await Flight.findById(flightId);
+    }
+    if (!flight && inlineFlight?.flightNumber) {
+        flight = await Flight.findOneAndUpdate(
+            { flightNumber: inlineFlight.flightNumber },
+            {
+                $setOnInsert: {
+                    flightNumber: inlineFlight.flightNumber,
+                    airline: inlineFlight.airline,
+                    origin: inlineFlight.origin,
+                    destination: inlineFlight.destination,
+                    departureDate: inlineFlight.departureDate,
+                    departureTime: inlineFlight.departureTime,
+                    isDirect: inlineFlight.isDirect ?? true,
+                    numberOfStops: inlineFlight.numberOfStops ?? 0,
+                    availableSeats: inlineFlight.availableSeats,
+                    basePrice: inlineFlight.basePrice,
+                },
+            },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+    }
+
     if (!flight) {
         res.status(404);
         throw new Error('Flight not found');
     }
 
+    // 2. Verify seat availability
     if (flight.availableSeats < numberOfSeats) {
         res.status(400);
         throw new Error('Not enough seats available');
     }
 
-    // 2. Calculate Total Price
+    // 3. Calculate Total Price
     // Multipliers: Economy (1x), Business (1.5x), First (2.5x)
     let multiplier = 1;
     if (seatClass === 'Business') multiplier = 1.5;
     if (seatClass === 'First') multiplier = 2.5;
 
     // Extra Luggage cost: $50 per unit (assumption, or could be passed)
-    // Prompt just said "Calculate totalPaid...". I'll assume extraLuggage is just a number.
-    // Let's assume $50 per extra luggage unit.
     const luggageCost = (extraLuggage || 0) * 50;
 
-    const totalPaid = (flight.basePrice * multiplier * numberOfSeats) + luggageCost;
+    // Price the user actually saw and agreed to at booking time — for a
+    // reused flightNumber this may differ slightly from the stored Flight
+    // document's basePrice (which is only set once, on first insert).
+    const unitPrice = inlineFlight?.basePrice ?? flight.basePrice;
+    const totalPaid = (unitPrice * multiplier * numberOfSeats) + luggageCost;
 
-    // 3. Create Booking
+    // 4. Create Booking
     const booking = await Booking.create({
         user: req.user.id,
-        flight: flightId,
+        flight: flight._id,
         numberOfSeats,
         seatClass,
         extraLuggage,
         totalPaid,
-        status: 'Confirmed'
+        status: 'Confirmed',
+        bundleId: bundleId || null,
+        legIndex: bundleId ? legIndex : null,
     });
 
-    // 4. Decrement Flight availableSeats
+    // 5. Decrement Flight availableSeats
     flight.availableSeats -= numberOfSeats;
     await flight.save();
 

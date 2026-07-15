@@ -22,6 +22,7 @@ app.use('/api/flights', require('./routes/flightRoutes'));
 app.use('/api/bookings', require('./routes/bookingRoutes'));
 app.use('/api/nlp', require('./routes/nlpRoutes'));
 app.use('/api/payments', require('./routes/paymentRoutes'));
+app.use('/api/admin', require('./routes/adminRoutes'));
 
 // Error Handler
 app.use(errorHandler);

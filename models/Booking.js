@@ -34,6 +34,20 @@ const bookingSchema = new mongoose.Schema({
         enum: ['Confirmed', 'Cancelled'],
         default: 'Confirmed',
     },
+    // Set when this booking is one leg of a multi-city bundle booked
+    // together (e.g. from the AI assistant's "Best Value Bundle") — every
+    // leg of the same bundle shares this id so My Bookings can group them
+    // back into a single card. Null for a standalone single-flight booking.
+    bundleId: {
+        type: String,
+        default: null,
+    },
+    // This leg's position within its bundle (0-based). Null when bundleId
+    // is null.
+    legIndex: {
+        type: Number,
+        default: null,
+    },
 }, {
     timestamps: true,
 });
