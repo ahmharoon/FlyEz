@@ -69,10 +69,17 @@ const mapFlightOption = (flightOption, { fallbackOrigin, fallbackDestination, is
     };
 };
 
-// @desc    Get flights — one-way, round-trip, or multi-city via SerpAPI Google Flights
-// @route   GET /api/flights
-// @access  Public
-const getFlights = asyncHandler(async (req, res) => {
+// Core flight-search logic, shared by the public GET /api/flights route and
+// the NLP assistant (nlpController) — both need the exact same SerpAPI/cache
+// behaviour, so this is a plain function returning the flights array rather
+// than an Express handler. Callers that aren't `getFlights` itself MUST
+// call this directly (in-process) rather than looping back over HTTP to
+// this same server: an HTTP self-call to "localhost" is unreliable in a
+// serverless deployment (there's no guarantee a request to the function's
+// own host actually reaches a live listener), and silently falling through
+// to a broad, unscoped fallback query on failure is what used to make the
+// NLP assistant return random unrelated flights.
+const searchFlights = async (filters) => {
     const {
         origin, destination, date, flight_status,
         type, return_date, travel_class,
@@ -82,7 +89,7 @@ const getFlights = asyncHandler(async (req, res) => {
         layover_duration, max_duration,
         outbound_times, return_times,
         emissions, currency,
-    } = req.query;
+    } = filters;
 
     const tripType = String(type || '2');
     const isMultiCity = tripType === '3';
@@ -100,11 +107,11 @@ const getFlights = asyncHandler(async (req, res) => {
                 let query = {};
                 if (flight_status) query.status = flight_status;
                 const cachedFlights = await Flight.find(query);
-                if (cachedFlights.length > 0) return res.status(200).json(cachedFlights);
+                if (cachedFlights.length > 0) return cachedFlights;
             }
 
             const fallback = await Flight.find({}).limit(50);
-            return res.status(200).json(fallback);
+            return fallback;
         }
 
         // For one-way with a specific route and fresh cache, try serving from DB first
@@ -122,7 +129,7 @@ const getFlights = asyncHandler(async (req, res) => {
                 const cachedFlights = await Flight.find(query);
                 if (cachedFlights.length > 0) {
                     console.log("Serving flights from MongoDB Cache");
-                    return res.status(200).json(cachedFlights);
+                    return cachedFlights;
                 }
             }
         }
@@ -233,7 +240,7 @@ const getFlights = asyncHandler(async (req, res) => {
             }
 
             const mappedFlights = legsWithFlights.flatMap(l => l.flights);
-            return res.status(200).json(mappedFlights);
+            return mappedFlights;
         }
 
         // Single-route (one-way / round-trip)
@@ -261,7 +268,7 @@ const getFlights = asyncHandler(async (req, res) => {
         const rawFlights = [...(data.best_flights || []), ...(data.other_flights || [])];
 
         if (rawFlights.length === 0) {
-            return res.status(200).json([]);
+            return [];
         }
 
         const mappedFlights = rawFlights.map(f => mapFlightOption(f, {
@@ -274,10 +281,18 @@ const getFlights = asyncHandler(async (req, res) => {
 
         // Only cache one-way searches in MongoDB
         if (!isRoundTrip && mappedFlights.length > 0) {
-            const bulkOps = mappedFlights.map(flight => ({
+            const bulkOps = mappedFlights.map(({ _id, ...flightWithoutId }) => ({
                 updateOne: {
-                    filter: { flightNumber: flight.flightNumber },
-                    update: { $set: flight },
+                    // `_id` on `flight` is a synthetic crypto.randomUUID() (see
+                    // mapFlightOption) needed only so the frontend's model has
+                    // something non-null — it's never a real Mongo ObjectId.
+                    // $set-ing it here made every upsert of a not-yet-cached
+                    // flight throw a CastError (silently caught below), which
+                    // meant a fresh SerpAPI result would fail to save and this
+                    // whole search would fall through to whatever was already
+                    // cached for the route — stale or entirely unrelated data.
+                    filter: { flightNumber: flightWithoutId.flightNumber },
+                    update: { $set: flightWithoutId },
                     upsert: true
                 }
             }));
@@ -292,11 +307,11 @@ const getFlights = asyncHandler(async (req, res) => {
 
             const savedFlightNumbers = mappedFlights.map(f => f.flightNumber);
             const finalSaved = await Flight.find({ flightNumber: { $in: savedFlightNumbers } });
-            return res.status(200).json(finalSaved);
+            return finalSaved;
         }
 
         // Round-trip: return mapped results directly (not cached)
-        res.status(200).json(mappedFlights);
+        return mappedFlights;
 
     } catch (error) {
         console.error('Flight fetch error:', error.response?.data || error.message);
@@ -312,7 +327,7 @@ const getFlights = asyncHandler(async (req, res) => {
                 });
                 if (fallbackFlights.length > 0) {
                     console.log("Fallback: Returning cached flights matching this route due to API failure.");
-                    return res.status(200).json(fallbackFlights);
+                    return fallbackFlights;
                 }
             } catch (e) {
                 console.error("Fallback query failed too.");
@@ -321,8 +336,16 @@ const getFlights = asyncHandler(async (req, res) => {
 
         // No matching flights, cached or otherwise — this is a legitimate
         // "no flights found" outcome, not a server error.
-        return res.status(200).json([]);
+        return [];
     }
+};
+
+// @desc    Get flights — one-way, round-trip, or multi-city via SerpAPI Google Flights
+// @route   GET /api/flights
+// @access  Public
+const getFlights = asyncHandler(async (req, res) => {
+    const flights = await searchFlights(req.query);
+    res.status(200).json(flights);
 });
 
 // @desc    Get flight details
@@ -387,4 +410,5 @@ module.exports = {
     getFlights,
     getFlightById,
     createFlight,
+    searchFlights,
 };
